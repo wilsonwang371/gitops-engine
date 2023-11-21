@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 
 	jsonpatch "github.com/evanphx/json-patch"
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +36,9 @@ import (
 const (
 	couldNotMarshalErrMsg       = "Could not unmarshal to object of type %s: %v"
 	AnnotationLastAppliedConfig = "kubectl.kubernetes.io/last-applied-configuration"
+
+	// Number of workers for diffing
+	numDiffWorkers = 3
 )
 
 // Holds diffing result of two resources
@@ -640,18 +644,43 @@ func DiffArray(configArray, liveArray []*unstructured.Unstructured, opts ...Opti
 	diffResultList := DiffResultList{
 		Diffs: make([]DiffResult, numItems),
 	}
-	for i := 0; i < numItems; i++ {
-		config := configArray[i]
-		live := liveArray[i]
-		diffRes, err := Diff(config, live, opts...)
-		if err != nil {
-			return nil, err
-		}
-		diffResultList.Diffs[i] = *diffRes
-		if diffRes.Modified {
-			diffResultList.Modified = true
-		}
+
+	// use goroutines to speed up diffing
+	errCh := make(chan error, numItems)
+	wg := sync.WaitGroup{}
+
+	// create goroutines to perform diffing
+	for i := 0; i < numDiffWorkers; i++ {
+		wg.Add(1)
+		go func(workerNum int) {
+			defer wg.Done()
+			for j := workerNum; j < numItems; j += numDiffWorkers {
+				config := configArray[j]
+				live := liveArray[j]
+				diffRes, err := Diff(config, live, opts...)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				diffResultList.Diffs[j] = *diffRes
+				if diffRes.Modified {
+					diffResultList.Modified = true
+				}
+			}
+		}(i)
 	}
+
+	// wait for goroutines to finish
+	wg.Wait()
+
+	// check for errors
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+	}
+	close(errCh)
+
 	return &diffResultList, nil
 }
 
